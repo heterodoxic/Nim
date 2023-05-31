@@ -227,8 +227,8 @@ proc isRecursiveType(t: PType, cycleDetector: var IntSet): bool =
 
 proc fitDefaultNode(c: PContext, n: PNode): PType =
   let expectedType = if n[^2].kind != nkEmpty: semTypeNode(c, n[^2], nil) else: nil
-  let oldType = n[^1].typ
   n[^1] = semConstExpr(c, n[^1], expectedType = expectedType)
+  let oldType = n[^1].typ
   n[^1].flags.incl nfSem
   if n[^2].kind != nkEmpty:
     if expectedType != nil and oldType != expectedType:
@@ -854,12 +854,18 @@ proc skipGenericInvocation(t: PType): PType {.inline.} =
   while result.kind in {tyGenericInst, tyGenericBody, tyRef, tyPtr, tyAlias, tySink, tyOwned}:
     result = lastSon(result)
 
-proc addInheritedFields(c: PContext, check: var IntSet, pos: var int,
-                        obj: PType) =
-  assert obj.kind == tyObject
-  if (obj.len > 0) and (obj[0] != nil):
-    addInheritedFields(c, check, pos, obj[0].skipGenericInvocation)
-  addInheritedFieldsAux(c, check, pos, obj.n)
+proc tryAddInheritedFields(c: PContext, check: var IntSet, pos: var int,
+                        obj: PType, n: PNode, isPartial = false): bool =
+  if (not isPartial) and (obj.kind notin {tyObject, tyGenericParam} or tfFinal in obj.flags):
+    localError(c.config, n.info, "Cannot inherit from: '" & $obj & "'")
+    result = false
+  elif obj.kind == tyObject:
+    result = true
+    if (obj.len > 0) and (obj[0] != nil):
+      result = result and tryAddInheritedFields(c, check, pos, obj[0].skipGenericInvocation, n)
+    addInheritedFieldsAux(c, check, pos, obj.n)
+  else:
+    result = true
 
 proc semObjectNode(c: PContext, n: PNode, prev: PType; flags: TTypeFlags): PType =
   if n.len == 0:
@@ -886,7 +892,9 @@ proc semObjectNode(c: PContext, n: PNode, prev: PType; flags: TTypeFlags): PType
           if concreteBase.sym != nil and concreteBase.sym.magic == mException and
               sfSystemModule notin c.module.flags:
             message(c.config, n.info, warnInheritFromException, "")
-          addInheritedFields(c, check, pos, concreteBase)
+          if not tryAddInheritedFields(c, check, pos, concreteBase, n):
+            return newType(tyError, nextTypeId c.idgen, result.owner)
+
       else:
         if concreteBase.kind != tyError:
           localError(c.config, n[1].info, "inheritance only works with non-final objects; " &
@@ -904,7 +912,9 @@ proc semObjectNode(c: PContext, n: PNode, prev: PType; flags: TTypeFlags): PType
     result.n = newNodeI(nkRecList, n.info)
   else:
     # partial object so add things to the check
-    addInheritedFields(c, check, pos, result)
+    if not tryAddInheritedFields(c, check, pos, result, n, isPartial = true):
+      return newType(tyError, nextTypeId c.idgen, result.owner)
+
   semRecordNodeAux(c, n[2], check, pos, result.n, result)
   if n[0].kind != nkEmpty:
     # dummy symbol for `pragma`:
@@ -968,7 +978,7 @@ proc semAnyRef(c: PContext; n: PNode; kind: TTypeKind; prev: PType): PType =
       t.rawAddSonNoPropagationOfTypeFlags result
       result = t
     else: discard
-    if result.kind == tyRef and c.config.selectedGC in {gcArc, gcOrc}:
+    if result.kind == tyRef and c.config.selectedGC in {gcArc, gcOrc, gcAtomicArc}:
       result.flags.incl tfHasAsgn
 
 proc findEnforcedStaticType(t: PType): PType =
@@ -1435,19 +1445,21 @@ proc semGenericParamInInvocation(c: PContext, n: PNode): PType =
   result = semTypeNode(c, n, nil)
   n.typ = makeTypeDesc(c, result)
 
-proc semObjectTypeForInheritedGenericInst(c: PContext, n: PNode, t: PType) =
+proc trySemObjectTypeForInheritedGenericInst(c: PContext, n: PNode, t: PType): bool =
   var
     check = initIntSet()
     pos = 0
   let
     realBase = t[0]
     base = skipTypesOrNil(realBase, skipPtrs)
+  result = true
   if base.isNil:
     localError(c.config, n.info, errIllegalRecursionInTypeX % "object")
   else:
     let concreteBase = skipGenericInvocation(base)
     if concreteBase.kind == tyObject and tfFinal notin concreteBase.flags:
-      addInheritedFields(c, check, pos, concreteBase)
+      if not tryAddInheritedFields(c, check, pos, concreteBase, n):
+        return false
     else:
       if concreteBase.kind != tyError:
         localError(c.config, n.info, errInheritanceOnlyWithNonFinalObjects)
@@ -1527,7 +1539,8 @@ proc semGeneric(c: PContext, n: PNode, s: PSym, prev: PType): PType =
     return errorType(c)
   if tx != result and tx.kind == tyObject:
     if tx[0] != nil:
-      semObjectTypeForInheritedGenericInst(c, n, tx)
+      if not trySemObjectTypeForInheritedGenericInst(c, n, tx):
+        return newOrPrevType(tyError, prev, c)
     var position = 0
     recomputeFieldPositions(tx, tx.n, position)
 
